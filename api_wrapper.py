@@ -16,6 +16,7 @@ SEMANTIC_SCHOLAR_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 OPENALEX_URL = "https://api.openalex.org/works"
 # 需要从 API 获取的论文字段
 FIELDS = "title,abstract,year,authors,citationCount,url"
+SEMANTIC_SCHOLAR_PAPER_URL = "https://api.semanticscholar.org/graph/v1/paper"
 MAX_RETRIES = 3
 
 
@@ -182,6 +183,106 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str | None:
             word_positions.append((pos, word))
     word_positions.sort()
     return " ".join(w for _, w in word_positions)
+
+
+def _parse_s2_paper(raw: dict) -> dict:
+    """将 Semantic Scholar API 返回的论文原始数据转为统一格式"""
+    authors = [
+        a["name"] for a in (raw.get("authors") or [])
+        if isinstance(a, dict) and a.get("name")
+    ]
+    return {
+        "paperId": raw.get("paperId", ""),
+        "title": raw.get("title", ""),
+        "abstract": raw.get("abstract"),
+        "year": raw.get("year"),
+        "authors": authors,
+        "citationCount": raw.get("citationCount", 0),
+        "url": raw.get("url", ""),
+    }
+
+
+def get_paper_references(paper_id: str, limit: int = 20) -> list[dict]:
+    """获取某篇论文的参考文献列表（即 PaSa 的 Expand 动作核心）
+
+    调用 Semantic Scholar 的 /paper/{id}/references 端点，
+    返回该论文引用的所有论文。模拟人类研究员"读 Related Work，
+    顺藤摸瓜"的行为——这是 PaSa 碾压关键词搜索的关键功能。
+
+    Args:
+        paper_id: Semantic Scholar 论文 ID
+        limit: 返回参考文献数量上限
+
+    Returns:
+        统一格式的论文列表
+    """
+    papers = []
+    headers = {}
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get(
+                f"{SEMANTIC_SCHOLAR_PAPER_URL}/{paper_id}/references",
+                params={"limit": limit, "fields": FIELDS},
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code == 429:
+                wait = 2 ** attempt
+                print(f"  [API] S2 rate limited, retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            for item in resp.json().get("data", []):
+                cited = item.get("citedPaper", {})
+                if cited:
+                    papers.append(_parse_s2_paper(cited))
+            return papers
+        except requests.RequestException as e:
+            print(f"  [API] S2 references failed (attempt {attempt+1}): {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(1)
+    return papers
+
+
+def expand_papers(paper_ids: list[str], limit: int = 20) -> list[dict]:
+    """批量展开多篇论文的参考文献，并行请求并自动去重
+
+    Args:
+        paper_ids: Semantic Scholar 论文 ID 列表
+        limit: 每篇论文返回的参考文献数量上限
+
+    Returns:
+        去重后的论文列表
+    """
+    all_refs = []
+    seen_ids = set()
+
+    with ThreadPoolExecutor(max_workers=min(len(paper_ids), 5)) as pool:
+        futures = {
+            pool.submit(get_paper_references, pid, limit): pid
+            for pid in paper_ids
+        }
+        for future in as_completed(futures):
+            pid = futures[future]
+            try:
+                refs = future.result()
+                new_count = 0
+                for p in refs:
+                    if p["paperId"] and p["paperId"] not in seen_ids:
+                        seen_ids.add(p["paperId"])
+                        all_refs.append(p)
+                        new_count += 1
+                print(f"  [Expand] \"{pid[:15]}...\" → {len(refs)} refs, {new_count} new")
+            except Exception as e:
+                print(f"  [Expand] \"{pid[:15]}...\" failed: {e}")
+
+    return all_refs
 
 
 if __name__ == "__main__":
